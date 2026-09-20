@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""Draw the current gh-stack stack, with worktree and pull request state.
+
+`gh stack view` already draws a chain of branches. This adds the two things
+it cannot know, both of which matter in this repository:
+
+- **Which branches are checked out in another worktree.** `gh stack rebase`
+  prints an error for such a branch, skips it, and still exits 0 — see
+  github/gh-stack#35, reproduced here on 2026-09-14. A stack operation that
+  half-runs is a silent-success failure, so the branches are named before
+  anything runs.
+- **The pull request and its checks** (`--prs` only). One `gh pr list` call
+  joined onto the stack, so "is this one green yet" does not mean opening a
+  browser.
+
+Exit codes: 0 drew the stack, 1 no stack here, 2 a branch is checked out in
+another worktree (`--check` only, so `just str` can refuse).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# Box-drawing and status glyphs. Kept together so the drawing below reads as
+# layout rather than punctuation.
+GLYPH_MERGED = "✓"
+GLYPH_QUEUED = "◎"
+GLYPH_CURRENT = "●"
+GLYPH_OPEN = "○"
+GLYPH_WARN = "⚠"
+PIPE = "│"
+ELBOW = "└"
+
+
+# ANSI colours, blanked when stdout is not a terminal so piped output stays
+# plain. `--no-colour` forces the same.
+class Palette:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def _wrap(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.enabled else text
+
+    def dim(self, text: str) -> str:
+        return self._wrap("2", text)
+
+    def bold(self, text: str) -> str:
+        return self._wrap("1", text)
+
+    def green(self, text: str) -> str:
+        return self._wrap("32", text)
+
+    def red(self, text: str) -> str:
+        return self._wrap("31", text)
+
+    def yellow(self, text: str) -> str:
+        return self._wrap("33", text)
+
+    def bold_yellow(self, text: str) -> str:
+        """Bold and yellow together, as one code.
+
+        Not `bold(yellow(text))`: the inner reset ends every attribute
+        rather than just the colour, so the bold stopped where the
+        colour did and the text came out yellow but light.
+        """
+        return self._wrap("1;33", text)
+
+    def blue(self, text: str) -> str:
+        return self._wrap("34", text)
+
+    def link(self, url: str, text: str) -> str:
+        """Make *text* clickable, with *url* hidden behind it.
+
+        OSC 8, which most terminals since about 2017 understand: the
+        URL travels in an escape sequence and only the label is drawn,
+        so a row keeps its width whatever the address behind it.
+
+        Gated on the same flag as the colours, and for the same
+        reason. A terminal that does not know the sequence prints it
+        as rubbish, and piped output would carry escapes into whatever
+        reads it next — so when stdout is not a terminal, or
+        `--no-colour` was passed, this hands back the plain text.
+        """
+        if not self.enabled or not url:
+            return text
+
+        start = f"\033]8;;{url}\033\\"
+        end = "\033]8;;\033\\"
+        return f"{start}{text}{end}"
+
+
+@dataclass
+class Branch:
+    """One layer of the stack, with everything joined onto it."""
+
+    name: str
+    is_current: bool
+    is_merged: bool
+    is_queued: bool
+    needs_rebase: bool
+    worktree: str | None = None
+    pr: dict[str, object] = field(default_factory=dict)
+
+
+def run(cmd: list[str], *, check: bool = True) -> str:
+    """Run a command and return its stdout, or "" when it fails and may."""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if check:
+            print(f"✗ {cmd[0]} failed: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        return ""
+    if result.returncode != 0 and check:
+        # gh prints its own diagnostics; passing them through is more use
+        # than restating them.
+        sys.stderr.write(result.stderr)
+        raise SystemExit(1)
+    return result.stdout if result.returncode == 0 else ""
+
+
+def read_stack() -> dict[str, object] | None:
+    """Parse `gh stack view --json`, or None when this branch has no stack.
+
+    `gh stack view` exits 0 and prints a human message to stdout when the
+    branch is not stacked, so the JSON parse is what distinguishes the two
+    cases rather than the exit code.
+    """
+    raw = run(["gh", "stack", "view", "--json"], check=False)
+    if not raw.strip():
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) and data.get("branches") else None
+
+
+def stack_entries(stack: dict[str, object]) -> list[dict[str, object]]:
+    """Return the branch entries from parsed stack JSON, typed.
+
+    `stack` holds `object` values because it came from `json.loads`, so
+    iterating `stack["branches"]` directly does not type-check. Narrowing it
+    once here keeps the two call sites free of repeated isinstance noise.
+    """
+    raw = stack.get("branches")
+    if not isinstance(raw, list):
+        return []
+    return [entry for entry in raw if isinstance(entry, dict)]
+
+
+def read_worktrees() -> dict[str, str]:
+    """Map branch name to the worktree checking it out, excluding this one.
+
+    Only branches held by *another* worktree matter: a branch checked out
+    here is the ordinary case and blocks nothing.
+    """
+    porcelain = run(["git", "worktree", "list", "--porcelain"], check=False)
+    here = Path.cwd().resolve()
+    occupied: dict[str, str] = {}
+    path: Path | None = None
+
+    for line in porcelain.splitlines():
+        if line.startswith("worktree "):
+            path = Path(line.split(" ", 1)[1]).resolve()
+        elif line.startswith("branch ") and path is not None:
+            branch = line.split(" ", 1)[1].removeprefix("refs/heads/")
+            if path != here:
+                occupied[branch] = path.name
+
+    return occupied
+
+
+def read_pull_requests(branches: list[str]) -> dict[str, dict[str, object]]:
+    """Join open and recently merged pull requests onto the stack branches.
+
+    One `gh pr list` call rather than one `gh pr view` per branch: a
+    six-deep stack would otherwise be six round trips. Checks come back in
+    the same response via statusCheckRollup.
+    """
+    # `--state open` and a small limit, deliberately. Asking for
+    # statusCheckRollup across 60 pull requests makes one GraphQL query large
+    # enough that GitHub answers HTTP 504, and the empty result then rendered
+    # as "no pull request" against every branch — a wrong answer that looked
+    # like an answer. A stack's branches are open by definition; a merged one
+    # is reported by `isMerged` in the stack data itself.
+    # Ask for every open pull request, not a guessed ceiling. At a flat 30,
+    # a repository with 69 open returned only the newest; a stack's branches
+    # are all older than those, so every branch drew as "no pull request" —
+    # which reads as "none opened yet" rather than "the list was cut short",
+    # and the CI columns went blank with it, statusCheckRollup riding in the
+    # same response. Sizing it from the stack was no better: 15 branches
+    # asked for 60 and still missed the oldest nine.
+    #
+    # `--limit` needs a number, so the count comes first, in a cheap call
+    # that asks for one field and no check state. Falling back to a large
+    # constant keeps the drawing working if that call fails.
+    counted = run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "500",
+            "--json",
+            "number",
+        ],
+        check=False,
+    )
+    try:
+        limit = max(len(json.loads(counted)), 30)
+    except (json.JSONDecodeError, TypeError):
+        limit = 200
+    raw = run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            str(limit),
+            "--json",
+            "number,headRefName,isDraft,state,statusCheckRollup,url",
+        ],
+        check=False,
+    )
+    if not raw.strip():
+        # Say so rather than returning silently: every branch would otherwise
+        # be labelled "no pull request", which is indistinguishable from the
+        # truth and is how this went unnoticed for two runs.
+        print(
+            "  ⚠ Could not read pull requests from GitHub — "
+            "showing the stack without them.",
+            file=sys.stderr,
+        )
+        return {}
+    try:
+        pull_requests = json.loads(raw)
+    except json.JSONDecodeError:
+        print(
+            "  ⚠ Unreadable response from `gh pr list` — "
+            "showing the stack without pull requests.",
+            file=sys.stderr,
+        )
+        return {}
+
+    wanted = set(branches)
+    found: dict[str, dict[str, object]] = {}
+    for pr in pull_requests:
+        head = pr.get("headRefName")
+        # First match wins: `gh pr list` returns newest first, so a branch
+        # reused across pull requests shows its current one.
+        if head in wanted and head not in found:
+            found[head] = pr
+    return found
+
+
+# The heavy tier: the CI jobs gated on `draft == false`, which a draft pull
+# request skips. Held as names because that is what statusCheckRollup
+# reports.
+#
+# Empty here, because this repository has no GitHub Actions workflows yet.
+# Every check therefore reads as the fast tier and the heavy mark shows as
+# a dash, which is accurate: nothing is gated on leaving draft. Add the job
+# names here if a two-tier CI setup arrives, and rename them here whenever
+# they are renamed in the workflow — a name that no longer matches shows up
+# as fast rather than silently vanishing.
+HEAVY_CHECKS: frozenset[str] = frozenset()
+
+PASSING = frozenset({"SUCCESS", "SKIPPED", "NEUTRAL"})
+FAILING = frozenset({"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED"})
+PENDING = frozenset({"QUEUED", "IN_PROGRESS", "PENDING", "WAITING"})
+
+
+def best_conclusion_per_check(
+    rollup: list[object],
+) -> dict[str, tuple[str, str]]:
+    """Reduce the roll-up to one status and conclusion per check name.
+
+    A check name appears more than once: the run fired while the pull
+    request was a draft skips the heavy tier, and a later run does it, so
+    the same name carries both SKIPPED and SUCCESS. Taking the last, or the
+    worst, would report every heavy job as skipped forever. The best
+    outcome per name is the true one — a job that has succeeded once on
+    this head has succeeded.
+    """
+    # Ranked so the most important outcome for the same name wins, which is
+    # not the same as the best one:
+    #
+    # - **failing** beats everything. A job that failed on this head has
+    #   failed, whatever a sibling entry says.
+    # - **pending** beats both finished states. A name with a run still in
+    #   flight is not settled, and reporting it as passed — which ranking
+    #   pending below passing did — showed a tick while the heavy tier was
+    #   visibly still running.
+    # - **passing** beats **skipped**, because a job that actually ran and
+    #   passed is the truer account of the same name than the draft run
+    #   that skipped it. Ranking those two equal reported every heavy job
+    #   as skipped even after it had run.
+    rank = {
+        "skipped": 0,
+        "passing": 1,
+        "pending": 2,
+        "failing": 3,
+    }
+    best: dict[str, tuple[str, str]] = {}
+
+    for check in rollup:
+        if not isinstance(check, dict):
+            continue
+        name = str(check.get("name") or check.get("context") or "")
+        if not name:
+            continue
+        status = str(check.get("status") or "")
+        conclusion = str(check.get("conclusion") or check.get("state") or "")
+
+        if status in PENDING:
+            kind = "pending"
+        elif conclusion == "SKIPPED":
+            kind = "skipped"
+        elif conclusion in PASSING:
+            kind = "passing"
+        elif conclusion in FAILING:
+            kind = "failing"
+        else:
+            kind = "pending"
+
+        previous = best.get(name)
+        if previous is None or rank[kind] > rank[previous[0]]:
+            best[name] = (kind, conclusion)
+
+    return best
+
+
+def summarise_checks(pr: dict[str, object], palette: Palette) -> str:
+    """Report the fast and heavy tiers separately, as two marks.
+
+    Two marks rather than one count, because they answer different
+    questions. The fast tier runs on every push and says whether the code
+    compiles and its tests pass. The heavy tier is gated on the pull
+    request not being a draft, so on a stack it is usually not run at all,
+    and one combined tick would hide that.
+
+    See HEAVY_CHECKS: it is empty in this repository, so every check
+    reports as fast and the heavy mark stays a dash.
+    """
+    rollup = pr.get("statusCheckRollup") or []
+    if not isinstance(rollup, list) or not rollup:
+        return palette.dim("no checks")
+
+    best = best_conclusion_per_check(rollup)
+
+    def mark(names: dict[str, tuple[str, str]]) -> str:
+        if not names:
+            # No heavy check has reported at all: the ordinary state of a
+            # draft pull request, and not a failure — hence green, like the
+            # tick, rather than dim. Nothing is wrong; nothing has run.
+            return palette.green("–")
+        kinds = {kind for kind, _ in names.values()}
+        if "failing" in kinds:
+            return palette.red("✗")
+        if "pending" in kinds:
+            # Green like the tick and the dash: a tier still running is not
+            # a problem, and only ✗ should draw the eye.
+            return palette.green("●")
+        # Every job skipped means the tier has not run — the ordinary state
+        # of a draft's heavy tier. Say so rather than showing a tick nobody
+        # earned. One job having actually run is enough to call it a pass,
+        # since the rest skipped on their own conditions.
+        if kinds == {"skipped"}:
+            return palette.green("–")
+        return palette.green("✓")
+
+    heavy = {n: v for n, v in best.items() if n in HEAVY_CHECKS}
+    fast = {n: v for n, v in best.items() if n not in HEAVY_CHECKS}
+
+    # Fast tier first, heavy second, always in that order and unlabelled:
+    # two marks in a fixed position are read at a glance, where the words
+    # only made the line longer.
+    return f"{mark(fast)} {mark(heavy)}"
+
+
+def build_branches(
+    stack: dict[str, object],
+    occupied: dict[str, str],
+    pull_requests: dict[str, dict[str, object]],
+) -> list[Branch]:
+    """Assemble the branch list, top of stack first."""
+    branches = [
+        Branch(
+            name=str(entry.get("name", "")),
+            is_current=bool(entry.get("isCurrent")),
+            is_merged=bool(entry.get("isMerged")),
+            is_queued=bool(entry.get("isQueued")),
+            needs_rebase=bool(entry.get("needsRebase")),
+            worktree=occupied.get(str(entry.get("name", ""))),
+            pr=pull_requests.get(str(entry.get("name", "")), {}),
+        )
+        for entry in stack_entries(stack)
+    ]
+    # gh reports bottom-to-top; drawn top-down so the trunk sits at the
+    # foot, matching `gh stack view` and how a stack is talked about.
+    branches.reverse()
+    return branches
+
+
+def draw(
+    branches: list[Branch],
+    trunk: str,
+    palette: Palette,
+    show_prs: bool,
+    hide_merged: bool = False,
+) -> None:
+    """Print the stack.
+
+    `hide_merged` drops the branches that have already landed. They are
+    kept by default because "what has gone in" is worth seeing, but a
+    long-lived stack accumulates them — five merged against ten live, on
+    2026-09-19 — and the part still being worked on is what a watch loop
+    is for. The count is still reported, so nothing disappears silently.
+    """
+    print()
+    merged_hidden = 0
+    for branch in branches:
+        if hide_merged and branch.is_merged:
+            merged_hidden += 1
+            continue
+        if branch.is_merged:
+            glyph = palette.green(GLYPH_MERGED)
+        elif branch.is_queued:
+            glyph = palette.blue(GLYPH_QUEUED)
+        elif branch.is_current:
+            glyph = palette.bold(GLYPH_CURRENT)
+        else:
+            glyph = GLYPH_OPEN
+
+        # The branch you are on is bold and yellow, and so is the rest
+        # of its row. It used to be bold with "← you are here" after it,
+        # which was the longest thing on the line for the least in it —
+        # the colour says the same and says it at a glance.
+        current = branch.is_current
+        name = palette.bold_yellow(branch.name) if current else branch.name
+
+        cells: list[str] = []
+        if show_prs and branch.pr:
+            number = branch.pr.get("number")
+            state = str(branch.pr.get("state", ""))
+            # The number carries the link rather than the branch name:
+            # it is already a reference to the pull request, and it is
+            # short enough that a reader can tell what they are about
+            # to open. The state word rides along inside the link so
+            # the whole cell is one target rather than a two-character
+            # one.
+            url = str(branch.pr.get("url", ""))
+
+            # An open pull request is just its number, draft or not. It
+            # used to read "ready", meaning out of draft — but bare
+            # "ready" sounds like a verdict on the code, which this
+            # cannot know. "draft" went the same way for a different
+            # reason: the heavy-tier mark on the same row is a dash
+            # exactly when nothing has run, which is what being a draft
+            # amounts to, so the word repeated what the row already
+            # said. Merged and closed stay, because no mark carries
+            # those.
+            if state == "MERGED":
+                text = f"#{number} merged"
+            elif state == "CLOSED":
+                text = f"#{number} closed"
+            else:
+                text = f"#{number}"
+
+            # On the current row the state colour gives way to the
+            # yellow: two colours in one cell would make one row look
+            # like two things. The words are the same either way — the
+            # colour says where you are, not what the state is.
+            if current:
+                label = palette.bold_yellow(text)
+            elif state == "MERGED":
+                label = palette.green(text)
+            elif state == "CLOSED":
+                label = palette.red(text)
+            elif branch.pr.get("isDraft"):
+                label = palette.dim(text)
+            else:
+                label = text
+            cells.append(palette.link(url, label))
+            cells.append(summarise_checks(branch.pr, palette))
+        elif show_prs and branch.is_merged:
+            # A merged branch has no *open* pull request, which is what the
+            # listing asks for — but "no pull request" then reads as "you
+            # never opened one", the opposite of what happened. The stack
+            # data still knows it merged, so say that.
+            cells.append(palette.green("merged"))
+        elif show_prs:
+            cells.append(palette.dim("no pull request"))
+
+        if branch.is_merged and not show_prs:
+            cells.append(palette.green("merged"))
+
+        suffix = "   ".join(cells)
+        line = f"  {glyph} {name}"
+        if suffix:
+            line = f"{line}   {suffix}"
+        print(line)
+
+        notes: list[str] = []
+        if branch.needs_rebase:
+            notes.append(palette.yellow(f"{GLYPH_WARN} needs rebase"))
+        if branch.worktree:
+            held = f"{GLYPH_WARN} checked out in {branch.worktree}"
+            notes.append(palette.yellow(held))
+        for note in notes:
+            print(f"  {PIPE}   {note}")
+        print(f"  {PIPE}")
+
+    if merged_hidden:
+        # Named on the trunk line rather than as a separate note: they
+        # merged into it, so that is where they went.
+        landed = "branch" if merged_hidden == 1 else "branches"
+        print(
+            f"  {ELBOW}─ {palette.dim(trunk)}   "
+            + palette.green(f"+{merged_hidden} merged {landed}")
+        )
+    else:
+        print(f"  {ELBOW}─ {palette.dim(trunk)}")
+    print()
+
+
+def draw_files(
+    stack: dict[str, object],
+    occupied: dict[str, str],
+    palette: Palette,
+    patch: bool,
+) -> None:
+    """List what each branch changes, against its own parent.
+
+    The parent, not the trunk: that is what makes a stack reviewable. A
+    branch three layers up diffed against `main` replays everything below
+    it, while diffed against its parent it shows only the unit it adds.
+    `base` in the stack JSON is the parent commit, so it is exactly the
+    left-hand side wanted here.
+    """
+    entries = stack_entries(stack)
+    print()
+    for entry in entries:
+        name = str(entry.get("name", ""))
+        base = str(entry.get("base", ""))
+        if not name or not base:
+            continue
+
+        marker = GLYPH_CURRENT if entry.get("isCurrent") else GLYPH_OPEN
+        heading = palette.bold(name) if entry.get("isCurrent") else name
+        print(f"  {marker} {heading}")
+
+        held = occupied.get(name)
+        if held:
+            note = f"{GLYPH_WARN} checked out in {held}"
+            print(f"      {palette.yellow(note)}")
+
+        # --stat for the summary, or the full patch when asked. Both are
+        # plain git, so the output is what any other review tool shows.
+        args = ["git", "diff", "--stat" if not patch else "--patch"]
+        body = run([*args, f"{base}..{name}"], check=False)
+        text = body.rstrip("\n")
+        if not text:
+            print(f"      {palette.dim('no changes')}")
+        else:
+            for line in text.split("\n"):
+                print(f"      {line}")
+        print()
+
+    print(f"  {ELBOW}─ {palette.dim(str(stack.get('trunk', 'main')))}")
+    print()
+
+
+def draw_no_stack(palette: Palette) -> None:
+    """Say what to run when the branch checked out is in no stack.
+
+    Bare `gh stack init`, which this used to suggest, is the one command
+    here that should not be run by hand: it skips the `feature/` prefix
+    branch protection requires, the worktree guard, and the redraw that
+    makes the result legible. So the advice is this repository's own
+    recipes and the skill that wraps them, in the order someone reading
+    this message needs them — check out a stack that already exists
+    before starting a second one for the same work.
+    """
+    branch = run(["git", "branch", "--show-current"], check=False).strip()
+    where = f" ({branch})" if branch else ""
+
+    # Command, alias, what it does. Aligned on the widest command, which
+    # is not known until the list is read — hence the two passes.
+    recipes = [
+        ("just stack-checkout", "stc", "check out an existing stack"),
+        ('just stack-new <name> "<message>"', "stn", "start one, from main"),
+        ("just stack-help", "sth", "list every stack recipe"),
+    ]
+    widest = max(len(command) for command, _, _ in recipes)
+
+    print(file=sys.stderr)
+    print(f"  No stack on this branch{where}.", file=sys.stderr)
+    print(file=sys.stderr)
+    for command, alias, description in recipes:
+        # Padded on the command's own length, never on the coloured
+        # version: the escape sequences take width in the string and none
+        # on the screen, so padding that would leave every line short by
+        # a different amount.
+        padding = " " * (widest - len(command))
+        print(
+            f"    {palette.bold(command)}{padding}   "
+            f"{palette.dim('j ' + alias)}   {description}",
+            file=sys.stderr,
+        )
+    print(file=sys.stderr)
+    print(
+        "  /st-crpd does a whole unit in one step: new branch, commit,\n"
+        "  rebase, push and a described draft pull request.",
+        file=sys.stderr,
+    )
+    print(file=sys.stderr)
+
+
+def report_blockers(branches: list[Branch], palette: Palette) -> bool:
+    """Name branches held by another worktree. True when any were found."""
+    blocked = [b for b in branches if b.worktree]
+    if not blocked:
+        return False
+
+    count = len(blocked)
+    noun = "branch is" if count == 1 else "branches are"
+    print(
+        palette.yellow(
+            f"  {GLYPH_WARN} {count} stack {noun} checked out in another "
+            "worktree:"
+        ),
+        file=sys.stderr,
+    )
+    for branch in blocked:
+        print(f"      {branch.name} → {branch.worktree}", file=sys.stderr)
+    print(file=sys.stderr)
+    print(
+        "    gh stack rebase prints an error for these, skips them, and\n"
+        "    still exits 0 (github/gh-stack#35), leaving the stack\n"
+        "    inconsistent. A stack lives in one worktree here.",
+        file=sys.stderr,
+    )
+    print(file=sys.stderr)
+    return True
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Draw the current stack with worktree and PR state."
+    )
+    parser.add_argument(
+        "--prs",
+        action="store_true",
+        help="join pull request and CI state from GitHub (one network call)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 2 if a stack branch is checked out in another worktree",
+    )
+    parser.add_argument(
+        "--files",
+        action="store_true",
+        help="list what each branch changes against its own parent",
+    )
+    parser.add_argument(
+        "--patch",
+        action="store_true",
+        help="with --files, show the full diff rather than a summary",
+    )
+    parser.add_argument(
+        "--hide-merged",
+        action="store_true",
+        help="leave out branches that have already merged",
+    )
+    parser.add_argument(
+        "--no-colour", action="store_true", help="disable ANSI colour"
+    )
+    parser.add_argument(
+        "--colour",
+        action="store_true",
+        help="force ANSI colour even when stdout is not a terminal",
+    )
+    args = parser.parse_args()
+
+    # `--colour` forces it on for a caller that captures the output and
+    # prints it itself — `just stack-watch` does exactly that, to fetch the
+    # new stack before clearing the screen rather than after. Without it the
+    # capture looks like a pipe and the colour is dropped.
+    coloured = args.colour or sys.stdout.isatty()
+    palette = Palette(coloured and not args.no_colour)
+
+    stack = read_stack()
+    if stack is None:
+        draw_no_stack(palette)
+        return 1
+
+    occupied = read_worktrees()
+    branch_names = [
+        str(entry.get("name", "")) for entry in stack_entries(stack)
+    ]
+    pull_requests = read_pull_requests(branch_names) if args.prs else {}
+    branches = build_branches(stack, occupied, pull_requests)
+    trunk = str(stack.get("trunk", "main"))
+
+    if args.files:
+        draw_files(stack, occupied, palette, patch=args.patch)
+    elif not args.check:
+        draw(
+            branches,
+            trunk,
+            palette,
+            show_prs=args.prs,
+            hide_merged=args.hide_merged,
+        )
+        # The drawing goes to stdout and the warning to stderr; flushing
+        # between them keeps the warning under the stack it refers to
+        # rather than above it when both land on a terminal.
+        sys.stdout.flush()
+
+    blocked = report_blockers(branches, palette)
+    return 2 if (blocked and args.check) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
