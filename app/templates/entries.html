@@ -1,0 +1,15 @@
+{% extends "base.html" %} {% block title %}Communications submitted to
+scheduler{% endblock %} {% block content %}
+<link
+  href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css"
+  rel="stylesheet"
+/>
+<h1>Database entries</h1>
+{% for entry in entries | reverse %}
+<h3>{{ entry.title }}</h3>
+<p><b>Long blurb:</b> {{ entry.long_blurb }}</p>
+<p><b>Short blurb:</b> {{ entry.short_blurb }}</p>
+<p><b>Selected clients:</b> {{ entry.selected_clients }}</p>
+<p><b>Image:</b> {{ entry.image }}</p>
+<p><b>Time stamp:</b> {{ entry.timestamp.strftime('%d-%m-%Y %H:%M:%S') }}</p>
+{% endfor%} {% endblock %}

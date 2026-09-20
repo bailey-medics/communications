@@ -1,0 +1,38 @@
+LINKEDIN
+
+💡 Transform Your Clinical Practice with Data Analytics! 💡
+
+Ever wondered how to leverage the data you’ve been collecting to better understand and improve your clinical practice? Or are you simply curious about machine learning and AI? 🚀
+
+The Data Analytics in Medicine (DAIM) course is here to guide you!
+
+🔍 What will you learn?
+
+Collect, analyse, and draw meaningful insights from clinical data.
+Explore the fundamentals of Python programming for working with medical data and images.
+Understand the impact of data and AI on clinical practice.
+🌟 Building on the success of the Programming in Healthcare course, the DAIM course takes your skills to the next level with hands-on workshops, real-world coding tasks, and expert support.
+
+🛠️ Course Highlights:
+📚 Seminars: Clear, digestible sessions on the core concepts.
+💻 Workshops: Hands-on experience with Python and medical imaging, supported by experienced tutors.
+
+🧑‍🏫 Modules Include:
+1️⃣ Core Python Concepts – Code structure and debugging.
+2️⃣ Python for Image Processing – Work with NumPy and PIL for image analysis.
+3️⃣ Python and DICOM – Analyse real-life medical imaging.
+4️⃣ Machine Learning for Medicine – Build a neural network to analyse chest X-rays using TensorFlow!
+
+📅 Course Starts: Tuesday, 11th March 2025, at 18:00 (UK time).
+
+🎟️ Secure Your Spot here - https://letsdodigital.org/tickets/daim/1
+
+Take this opportunity to level up your digital healthcare skills and transform the way you work with medical data! 🚑📊
+
+TWITTER AND CO
+
+Join the Data Analytics in Medicine (DAIM) course to:
+- Learn Python for medical data & imaging.
+- Explore machine learning & AI in healthcare.
+- Gain hands-on coding skills with expert support.
+https://letsdodigital.org/tickets/daim/1.html
