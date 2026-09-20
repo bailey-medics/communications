@@ -12,13 +12,6 @@ initialise:= 'set -euxo pipefail
     just _terminal-description'
 
 
-alias a := app
-# Run the web app
-app:
-    #!/usr/bin/env bash
-    {{initialise}} "web app"
-    poetry run python app/app.py
-    
 _terminal-description message=" ":
     echo -ne "\033]0;{{message}}\007"
 

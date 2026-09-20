@@ -8,9 +8,6 @@ pytooter_clientcred.secret
 __pycache__/
 *.py[cod]
 *$py.class
-user_data/
-cookies.pkl
-uploads/
 
 # C extensions
 *.so
